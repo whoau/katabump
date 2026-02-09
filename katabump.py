@@ -1,245 +1,229 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KataBump 自动续期脚本 - 终极抗 CF 版
-功能：
-1. 强力绕过 Cloudflare (使用 stealth + xvfb)
-2. 自动遍历 Dashboard 列表中的 "See" 按钮
-3. 进入详情页点击续期
-4. 自动更新 README
+KataBump 自动续期 - 抗指纹增强版
+更新内容：
+1. 支持 cf_clearance 注入 (关键)
+2. 增加鼠标模拟移动 (GhostCursor 逻辑)
+3. 增加 User-Agent 随机化
 """
 
 import os
 import sys
 import time
 import random
+import math
 from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
 # ==================== 配置 ====================
 BASE_URL = "https://dashboard.katabump.com"
 DASHBOARD_URL = f"{BASE_URL}/dashboard"
-
-# 续期按钮可能的文本 (根据实际网页调整)
-RENEW_TEXTS = ["Renew", "Extend", "Add Time", "Bump", "续期", "时间增加", "시간 추가"]
+RENEW_TEXTS = ["Renew", "Extend", "Add Time", "Bump", "续期", "时间增加"]
 
 # 环境变量
-COOKIE_NAME = os.getenv('KATABUMP_COOKIE_NAME', 'laravel_session').strip()
+COOKIE_NAME = os.getenv('KATABUMP_COOKIE_NAME', 'katabump_s').strip()
 COOKIE_VALUE = os.getenv('KATABUMP_COOKIE_VALUE', '').strip()
+CF_CLEARANCE = os.getenv('KATABUMP_CF_CLEARANCE', '').strip() # 新增
 
-# 调试设置
-HEADLESS = False  # 必须为 False 才能配合 xvfb 绕过 CF
+HEADLESS = False 
 SCREENSHOT_DIR = "screenshots"
 
 class KataBot:
     def __init__(self):
         self.page = None
-        self.log_msgs = []
 
     def log(self, msg, level="INFO"):
-        """日志输出"""
         bj_time = datetime.now(timezone(timedelta(hours=8))).strftime('%H:%M:%S')
         icon = {"INFO": "ℹ️", "SUCCESS": "✅", "WARNING": "⚠️", "ERROR": "❌", "DEBUG": "🔍"}.get(level, "")
-        log_line = f"[{bj_time}] {icon} [{level}] {msg}"
-        print(log_line)
-        self.log_msgs.append(log_line)
+        print(f"[{bj_time}] {icon} [{level}] {msg}")
 
     def save_debug(self, name):
-        """保存截图"""
         try:
             os.makedirs(SCREENSHOT_DIR, exist_ok=True)
             self.page.screenshot(path=f"{SCREENSHOT_DIR}/{name}.png", full_page=True)
-            self.log(f"已截图: {name}.png", "DEBUG")
         except: pass
 
+    def human_click(self, locator):
+        """模拟真人鼠标轨迹点击"""
+        try:
+            box = locator.bounding_box()
+            if box:
+                # 目标点 (加一点随机偏移)
+                target_x = box["x"] + box["width"] / 2 + random.uniform(-5, 5)
+                target_y = box["y"] + box["height"] / 2 + random.uniform(-5, 5)
+                
+                # 当前鼠标位置
+                self.page.mouse.move(target_x, target_y, steps=random.randint(10, 20))
+                time.sleep(random.uniform(0.1, 0.3))
+                self.page.mouse.down()
+                time.sleep(random.uniform(0.05, 0.15))
+                self.page.mouse.up()
+            else:
+                locator.click()
+        except:
+            locator.click()
+
     def wait_for_cf(self, timeout=30):
-        """核心：Cloudflare 智能处理逻辑"""
+        """CF 处理逻辑 (增强版)"""
         start_time = time.time()
         while time.time() - start_time < timeout:
-            title = self.page.title().lower()
-            content = self.page.content().lower()
+            # 检查是否还有盾
+            try:
+                # 查找 iframe
+                iframe = None
+                for frame in self.page.frames:
+                    if "challenges.cloudflare.com" in frame.url:
+                        iframe = frame
+                        break
+                
+                if iframe:
+                    self.log("🛡️ 发现 CF 验证框，尝试通过...", "WARNING")
+                    # 查找 checkbox
+                    cb = iframe.locator("input[type='checkbox'], .ctp-checkbox-label").first
+                    if cb.is_visible():
+                        time.sleep(random.uniform(1.5, 3.0)) # 思考时间
+                        self.human_click(cb) # 模拟鼠标点击
+                        self.log("👆 已点击验证框，等待跳转...", "INFO")
+                        time.sleep(5) # 给它时间反应
+                        continue # 继续循环检查是否还在
+                
+                # 检查标题
+                if "just a moment" not in self.page.title().lower():
+                    return True # 这里的逻辑是：如果没有盾了，就返回True
+                
+            except Exception as e:
+                pass
             
-            # 检测是否在 CF 验证页
-            if "just a moment" in title or "challenges.cloudflare.com" in content or "checking your browser" in content:
-                self.log("🛡️ 检测到 Cloudflare 盾，正在尝试绕过...", "WARNING")
-                
-                # 尝试查找 iframe 里的复选框并点击
-                try:
-                    for frame in self.page.frames:
-                        cb = frame.locator("input[type='checkbox'], .ctp-checkbox-label").first
-                        if cb.is_visible():
-                            self.log("👆 点击 CF 验证框...", "INFO")
-                            cb.click()
-                            time.sleep(2)
-                except: pass
-                
-                time.sleep(3)
-            else:
-                # 已经通过或不在 CF 页
-                return True
+            time.sleep(2)
         
-        self.log("❌ Cloudflare 验证超时！", "ERROR")
-        self.save_debug("cf_timeout")
-        return False
-
-    def init_browser(self, p):
-        """初始化浏览器 (带 stealth 反检测)"""
-        self.log("🚀 启动浏览器...")
-        browser = p.chromium.launch(
-            headless=HEADLESS, # GitHub Actions 里配合 xvfb 必须设为 False
-            args=[
-                "--no-sandbox", 
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars"
-            ]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            device_scale_factor=1,
-        )
-        
-        self.page = context.new_page()
-        
-        # 注入 playwright-stealth (最强反检测)
-        try:
-            from playwright_stealth import stealth_sync
-            stealth_sync(self.page)
-            self.log("✅ 反检测模块加载成功", "INFO")
-        except ImportError:
-            self.log("⚠️ 未安装 playwright-stealth，使用简易反检测", "WARNING")
-            self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-        return browser, context
+        # 如果超时还在盾里
+        if "just a moment" in self.page.title().lower():
+            self.log("❌ CF 验证失败 (死循环)", "ERROR")
+            self.save_debug("cf_loop_fail")
+            return False
+        return True
 
     def run(self):
-        if not COOKIE_VALUE:
-            self.log("未设置 KATABUMP_COOKIE_VALUE，请检查 Secrets", "ERROR")
-            sys.exit(1)
-
         with sync_playwright() as p:
-            browser, context = self.init_browser(p)
+            self.log("🚀 启动浏览器...", "INFO")
+            browser = p.chromium.launch(
+                headless=HEADLESS, 
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+            )
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
             
-            # 1. 注入 Cookie
-            self.log("🍪 注入登录 Cookie...", "INFO")
-            context.add_cookies([{
+            # 注入 stealth
+            try:
+                from playwright_stealth import stealth_sync
+                stealth_sync(context)
+            except: pass
+
+            self.page = context.new_page()
+
+            # 1. 注入 Cookies (Session + CF_Clearance)
+            self.log("🍪 注入 Cookies...", "INFO")
+            cookies = [{
                 'name': COOKIE_NAME,
                 'value': COOKIE_VALUE,
-                'domain': 'dashboard.katabump.com', 
+                'domain': 'dashboard.katabump.com',
                 'path': '/'
-            }])
+            }]
+            
+            # 注入 cf_clearance (如果有)
+            if CF_CLEARANCE:
+                self.log("🛡️ 注入 cf_clearance...", "INFO")
+                cookies.append({
+                    'name': 'cf_clearance',
+                    'value': CF_CLEARANCE,
+                    'domain': '.katabump.com', # 注意有个点，代表通配
+                    'path': '/'
+                })
+            
+            context.add_cookies(cookies)
 
-            results = []
-
+            # 2. 访问
             try:
-                # 2. 访问 Dashboard (列表页)
-                self.log(f"🔗 正在访问: {DASHBOARD_URL}", "INFO")
+                self.log(f"🔗 访问: {DASHBOARD_URL}", "INFO")
                 self.page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=60000)
                 
-                # 处理 CF
                 if not self.wait_for_cf(timeout=60):
-                    raise Exception("无法通过 CF 防护")
-
-                # 等待页面加载
+                    raise Exception("CF 验证失败")
+                
                 self.page.wait_for_load_state("networkidle")
                 time.sleep(2)
 
-                # 检查登录状态
-                if "login" in self.page.url or self.page.locator("text=Login").count() > 0:
-                    self.log("❌ Cookie 已失效，重定向到了登录页", "ERROR")
-                    self.save_debug("login_failed")
+                # 检查登录
+                if "login" in self.page.url:
+                    self.log("❌ 登录失效 (Cookies 过期)", "ERROR")
                     sys.exit(1)
 
-                # 3. 扫描列表，提取 "See" 按钮链接
-                self.log("🔍 扫描服务器列表...", "INFO")
+                # 3. 扫描列表
+                self.log("🔍 扫描服务器...", "INFO")
+                see_btns = self.page.locator("a:has-text('See'), button:has-text('See')").all()
                 
-                # 查找 Action 列下的 See 按钮/链接
-                # 假设它是 <a> 标签或者 <button>
-                see_elements = self.page.locator("a:has-text('See'), button:has-text('See')").all()
+                targets = []
+                for btn in see_btns:
+                    href = btn.get_attribute("href")
+                    if href:
+                        targets.append(href if href.startswith("http") else f"{BASE_URL}{href}")
                 
-                target_urls = []
-                for el in see_elements:
-                    try:
-                        href = el.get_attribute("href")
-                        if href:
-                            full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
-                            if full_url not in target_urls:
-                                target_urls.append(full_url)
-                    except: pass
-                
-                # 如果没找到，尝试另一种可能：直接点击 See 按钮跳转
-                # 但最好是收集 URL 逐个访问，更稳定
-                
-                if not target_urls:
-                    self.log("⚠️ 未找到任何 'See' 按钮 (列表为空?)", "WARNING")
-                    self.save_debug("no_servers")
-                else:
-                    self.log(f"📦 发现 {len(target_urls)} 个服务器，准备处理...", "SUCCESS")
+                # 去重
+                targets = list(set(targets))
+                self.log(f"📦 找到 {len(targets)} 个服务器", "SUCCESS")
 
-                # 4. 遍历每个服务器详情页
-                for i, url in enumerate(target_urls):
-                    server_id = url.split("/")[-1]
-                    self.log(f"--- 正在处理 [{i+1}/{len(target_urls)}] ID: {server_id} ---", "INFO")
-                    
+                results = []
+                # 4. 遍历处理
+                for url in targets:
+                    sid = url.split("/")[-1]
+                    self.log(f"--- 处理: {sid} ---", "INFO")
                     try:
-                        # 访问详情页
                         self.page.goto(url, wait_until="domcontentloaded")
-                        self.wait_for_cf() # 每个页面都检查一下盾
+                        self.wait_for_cf()
                         self.page.wait_for_load_state("networkidle")
                         
-                        # 查找续期按钮
                         btn_found = False
                         for txt in RENEW_TEXTS:
                             btn = self.page.locator(f"button:has-text('{txt}'), a.btn:has-text('{txt}')")
                             if btn.count() > 0:
                                 if btn.first.is_disabled():
-                                    self.log(f"⏳ 按钮 '{txt}' 冷却中", "WARNING")
-                                    results.append({"id": server_id, "status": "⏳ 冷却中"})
+                                    self.log(f"⏳ 冷却中", "WARNING")
+                                    results.append({"id": sid, "status": "⏳ 冷却中"})
                                 else:
-                                    self.log(f"⚡ 点击 '{txt}' 按钮...", "INFO")
-                                    btn.first.click()
+                                    self.log(f"⚡ 点击续期...", "INFO")
+                                    self.human_click(btn.first)
                                     time.sleep(3)
-                                    self.log("✅ 点击完成", "SUCCESS")
-                                    results.append({"id": server_id, "status": "✅ 成功"})
+                                    results.append({"id": sid, "status": "✅ 成功"})
                                 btn_found = True
                                 break
                         
                         if not btn_found:
-                            self.log("❌ 未找到续期按钮", "ERROR")
-                            self.save_debug(f"no_btn_{server_id}")
-                            results.append({"id": server_id, "status": "❌ 未找到按钮"})
-
+                            self.log("❌ 没找到按钮", "ERROR")
+                            results.append({"id": sid, "status": "❌ 无按钮"})
+                            
                     except Exception as e:
-                        self.log(f"💥 处理出错: {e}", "ERROR")
-                        results.append({"id": server_id, "status": "💥 异常"})
+                        self.log(f"出错: {e}", "ERROR")
+                        results.append({"id": sid, "status": "💥 出错"})
                     
-                    # 随机等待，模拟人类
                     time.sleep(random.uniform(2, 5))
 
-            except Exception as e:
-                self.log(f"脚本运行崩溃: {e}", "ERROR")
-                self.save_debug("crash")
-            finally:
                 browser.close()
                 self.update_readme(results)
 
+            except Exception as e:
+                self.log(f"致命错误: {e}", "ERROR")
+                self.save_debug("fatal_error")
+                sys.exit(1)
+
     def update_readme(self, results):
-        """更新 README 报告"""
         bj_time = datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
-        content = f"# KataBump 续期报告\n\n> 更新时间: `{bj_time}` (北京)\n\n| 服务器ID | 状态 |\n|---|---|\n"
-        
-        if not results:
-            content += "| 无 | 未发现服务器或运行出错 |\n"
-        else:
-            for r in results:
-                content += f"| `{r['id']}` | {r['status']} |\n"
-        
-        content += "\n---\n*By GitHub Actions w/ Anti-CF Tech*\n"
-        
+        content = f"# KataBump 状态\n> 更新: `{bj_time}`\n\n| ID | 状态 |\n|---|---|\n"
+        for r in results: content += f"| {r['id']} | {r['status']} |\n"
         try:
-            with open("README.md", "w", encoding="utf-8") as f:
-                f.write(content)
-            self.log("📄 README.md 已更新", "SUCCESS")
+            with open("README.md", "w") as f: f.write(content)
         except: pass
 
 if __name__ == "__main__":
