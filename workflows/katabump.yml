@@ -1,0 +1,87 @@
+name: Auto KataBump Renew
+
+on:
+  schedule:
+    # 北京时间 12:00 (UTC 04:00)，每 3 天运行一次 (1号, 4号, 7号...)
+    - cron: '0 4 */3 * *'
+  workflow_dispatch: # 允许手动点击按钮触发
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    
+    # 授予写入权限，以便更新 README.md
+    permissions:
+      contents: write
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. 设置 Python 环境
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 3. 安装系统级依赖 (Xvfb 和 字体)
+      # Xvfb 用于模拟显示器以绕过 Cloudflare 检测
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb fonts-noto-cjk
+
+      # 4. 安装 Python 依赖
+      - name: Install Python Libraries
+        run: |
+          # 安装 playwright 和 反检测插件
+          pip install playwright==1.52.0 playwright-stealth==1.0.6
+          # 安装浏览器内核
+          playwright install chromium --with-deps
+
+      # 5. 运行续期脚本 (核心步骤)
+      - name: Run KataBump Script
+        env:
+          # 从 GitHub Secrets 读取 Cookie 配置
+          KATABUMP_COOKIE_NAME: ${{ secrets.KATABUMP_COOKIE_NAME }}   # 例如: laravel_session
+          KATABUMP_COOKIE_VALUE: ${{ secrets.KATABUMP_COOKIE_VALUE }} # 你的 Session 值
+          
+          # 关键环境配置：禁用无头模式 + 指定虚拟显示器
+          HEADLESS: 'false'
+          DISPLAY: ':99'
+        run: |
+          # 启动虚拟显示器 (分辨率设为 1920x1080)
+          Xvfb :99 -screen 0 1920x1080x24 &
+          
+          # 等待 Xvfb 启动
+          sleep 2
+          
+          # 运行 Python 脚本 (确保你的脚本文件名是 katabump.py)
+          python katabump.py
+
+      # 6. 提交更改 (更新 README.md)
+      - name: Commit & Push README
+        if: always() # 即使脚本出错也尝试提交结果
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # 检查 README 是否有变动
+          if [[ -n $(git status -s README.md) ]]; then
+            git add README.md
+            git commit -m "📝 Update KataBump status $(date +'%Y-%m-%d')"
+            git push
+            echo "README updated."
+          else
+            echo "No changes to README."
+          fi
+
+      # 7. 上传截图 (仅当失败时，用于调试)
+      - name: Upload Debug Artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: screenshots/
+          retention-days: 3
