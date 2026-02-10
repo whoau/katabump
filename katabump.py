@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KataBump 自动续期 - 指定登录页版
-URL: https://dashboard.katabump.com/auth/login
-功能：
-1. 访问指定登录页
-2. 输入邮箱密码登录
-3. 遍历服务器并续期
-4. 强力抗 Cloudflare
+KataBump 自动续期 - 点击交互版
+逻辑：
+1. 登录
+2. 在 Dashboard 找到 Action 列的 See 按钮
+3. 直接点击进入详情页 (不拼接URL)
+4. 点击续期
+5. 返回列表处理下一个
 """
 
 import os
@@ -19,17 +19,15 @@ from playwright.sync_api import sync_playwright
 
 # ==================== 配置 ====================
 BASE_URL = "https://dashboard.katabump.com"
-# 你指定的登录页
 LOGIN_URL = "https://dashboard.katabump.com/auth/login"
 DASHBOARD_URL = f"{BASE_URL}/dashboard"
 
-# 续期按钮文本 (根据实际页面调整)
+# 续期按钮文本
 RENEW_TEXTS = ["Renew", "Extend", "Add Time", "Bump", "续期", "时间增加"]
 
 # 环境变量
 LOGIN_EMAIL = os.getenv('KATABUMP_EMAIL', '').strip()
 LOGIN_PASSWORD = os.getenv('KATABUMP_PASSWORD', '').strip()
-# 可选：CF通行证 (仅用于过5秒盾，不是登录Cookie)
 CF_CLEARANCE = os.getenv('KATABUMP_CF_CLEARANCE', '').strip()
 
 HEADLESS = False 
@@ -51,18 +49,15 @@ class KataBot:
         except: pass
 
     def human_type(self, selector, text):
-        """模拟真人打字"""
         try:
             self.page.wait_for_selector(selector, timeout=5000)
             self.page.focus(selector)
             for char in text:
                 self.page.keyboard.type(char, delay=random.randint(50, 150))
             time.sleep(random.uniform(0.5, 1.0))
-        except Exception as e:
-            self.log(f"输入失败 ({selector}): {e}", "ERROR")
+        except: pass
 
     def wait_for_cf(self, timeout=30):
-        """过 Cloudflare 5秒盾"""
         start_time = time.time()
         while time.time() - start_time < timeout:
             title = self.page.title().lower()
@@ -81,139 +76,129 @@ class KataBot:
         return False
 
     def login(self):
-        """执行账号密码登录"""
         self.log(f"正在访问登录页: {LOGIN_URL}", "INFO")
-        
         try:
-            # 1. 访问指定的登录页
             self.page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-            
-            # 处理 CF
-            if not self.wait_for_cf(timeout=60):
-                self.log("❌ 无法通过 CF 防护", "ERROR")
-                return False
-
+            if not self.wait_for_cf(timeout=60): return False
             self.page.wait_for_load_state("networkidle")
 
-            # 2. 寻找输入框
-            # 兼容常见的 name 属性
-            email_sel = "input[name='email'], input[type='email']"
-            pass_sel = "input[name='password'], input[type='password']"
-            
-            if self.page.locator(email_sel).count() > 0:
-                self.log("找到登录表单，输入账号密码...", "INFO")
+            if self.page.locator("input[name='email']").count() > 0:
+                self.log("输入账号密码...", "INFO")
+                self.human_type("input[name='email']", LOGIN_EMAIL)
+                self.human_type("input[name='password']", LOGIN_PASSWORD)
                 
-                # 输入
-                self.human_type(email_sel, LOGIN_EMAIL)
-                self.human_type(pass_sel, LOGIN_PASSWORD)
-                
-                # 3. 提交
-                submit_btn = self.page.locator("button[type='submit'], input[type='submit']").first
-                if submit_btn.is_visible():
-                    self.log("点击登录按钮...", "INFO")
-                    submit_btn.click()
-                    
-                    # 等待跳转
+                btn = self.page.locator("button[type='submit'], input[type='submit']").first
+                if btn.is_visible():
+                    self.log("点击登录...", "INFO")
+                    btn.click()
                     self.page.wait_for_load_state("networkidle")
                     self.wait_for_cf()
-                    time.sleep(5) # 多等一会，确保跳转完成
+                    time.sleep(5)
                     
-                    # 4. 验证结果
-                    # 如果 URL 变了，或者包含 dashboard，或者没有 login，就算成功
-                    current_url = self.page.url
-                    if "login" not in current_url or "dashboard" in current_url:
+                    if "login" not in self.page.url:
                         self.log("✅ 登录成功！", "SUCCESS")
                         return True
-                    else:
-                        # 检查错误提示
-                        error_msg = self.page.locator(".alert-danger, .error, .text-red-500").first
-                        if error_msg.is_visible():
-                            self.log(f"❌ 登录失败提示: {error_msg.inner_text()}", "ERROR")
-                        else:
-                            self.log(f"❌ 登录失败，仍停留在: {current_url}", "ERROR")
-                        self.save_debug("login_fail")
-                        return False
-            else:
-                self.log("❌ 未找到邮箱/密码输入框，页面结构可能变化", "ERROR")
-                self.save_debug("no_login_form")
-                return False
-
+            
+            self.log("❌ 登录失败", "ERROR")
+            self.save_debug("login_fail")
+            return False
         except Exception as e:
-            self.log(f"登录过程出错: {e}", "ERROR")
+            self.log(f"登录出错: {e}", "ERROR")
             return False
 
     def process_renewal(self):
-        """处理续期逻辑"""
-        # 有时候登录后会自动跳转 Dashboard，有时候不会，这里强制访问一次
-        if "dashboard" not in self.page.url:
-            self.log(f"🔗 前往 Dashboard: {DASHBOARD_URL}", "INFO")
-            self.page.goto(DASHBOARD_URL, wait_until="networkidle")
-            self.wait_for_cf()
+        """核心逻辑：遍历并点击 See 按钮"""
+        results = []
         
         try:
-            # 二次检查是否掉线
-            if "login" in self.page.url:
-                self.log("❌ 访问 Dashboard 时被重定向回登录页", "ERROR")
+            # 1. 确保在 Dashboard
+            if "dashboard" not in self.page.url:
+                self.page.goto(DASHBOARD_URL, wait_until="networkidle")
+                self.wait_for_cf()
+
+            # 2. 统计有多少个 "See" 按钮
+            # 我们不存 URL，存索引，因为页面刷新后元素会失效
+            # 查找文本为 "See" 的按钮或链接
+            selector = "a:has-text('See'), button:has-text('See')"
+            
+            # 等待列表加载
+            try:
+                self.page.wait_for_selector(selector, timeout=10000)
+            except:
+                self.log("⚠️ 未找到 'See' 按钮 (列表为空?)", "WARNING")
+                self.save_debug("no_see_buttons")
                 return []
 
-            self.log("🔍 扫描服务器列表...", "INFO")
-            # 查找 'See' 按钮
-            see_btns = self.page.locator("a:has-text('See'), button:has-text('See')").all()
-            
-            targets = []
-            for btn in see_btns:
-                href = btn.get_attribute("href")
-                if href: targets.append(href if href.startswith("http") else f"{BASE_URL}{href}")
-            
-            # 去重
-            targets = list(set(targets))
-            
-            if not targets:
-                self.log("⚠️ 未找到任何服务器 (列表为空?)", "WARNING")
-                self.save_debug("no_servers")
-                # 尝试打印页面内容的一小部分用于调试
-                # print(self.page.content()[:500])
-                return []
+            count = self.page.locator(selector).count()
+            self.log(f"📦 发现 {count} 个服务器", "SUCCESS")
 
-            self.log(f"📦 发现 {len(targets)} 个服务器", "SUCCESS")
-            results = []
-
-            for url in targets:
-                sid = url.split("/")[-1]
-                self.log(f"--- 处理: {sid} ---", "INFO")
-                try:
-                    self.page.goto(url, wait_until="domcontentloaded")
+            # 3. 循环处理每一个
+            for i in range(count):
+                self.log(f"--- 准备处理第 {i+1} 个服务器 ---", "INFO")
+                
+                # 每次循环都要重新定位，因为我们会跳转页面
+                # 如果不在 Dashboard，先回去
+                if "dashboard" not in self.page.url:
+                    self.page.goto(DASHBOARD_URL, wait_until="networkidle")
                     self.wait_for_cf()
-                    self.page.wait_for_load_state("networkidle")
-                    
-                    btn_found = False
-                    for txt in RENEW_TEXTS:
-                        btn = self.page.locator(f"button:has-text('{txt}'), a.btn:has-text('{txt}')")
-                        if btn.count() > 0:
-                            if btn.first.is_disabled():
-                                self.log("⏳ 冷却中/不可用", "WARNING")
-                                results.append({"id": sid, "status": "⏳ 冷却中"})
-                            else:
-                                self.log(f"⚡ 点击 '{txt}'...", "INFO")
-                                btn.first.click()
-                                time.sleep(3)
-                                results.append({"id": sid, "status": "✅ 成功"})
-                            btn_found = True
-                            break
-                    
-                    if not btn_found:
-                        results.append({"id": sid, "status": "❌ 无按钮"})
+                    time.sleep(2)
                 
-                except Exception as e:
-                    self.log(f"出错: {e}", "ERROR")
-                    results.append({"id": sid, "status": "💥 出错"})
+                # 获取第 i 个按钮
+                see_btn = self.page.locator(selector).nth(i)
                 
+                if not see_btn.is_visible():
+                    self.log(f"第 {i+1} 个按钮不可见，跳过", "WARNING")
+                    continue
+                
+                # 4. 点击 "See" 进入详情页
+                self.log("👆 点击 'See' 按钮...", "INFO")
+                see_btn.click()
+                
+                # 等待跳转
+                self.page.wait_for_load_state("domcontentloaded")
+                self.wait_for_cf()
+                self.page.wait_for_load_state("networkidle")
                 time.sleep(2)
-            
+
+                # 获取当前 ID 用于记录
+                try:
+                    current_url = self.page.url
+                    if "id=" in current_url:
+                        sid = current_url.split("id=")[1].split("&")[0]
+                    else:
+                        sid = current_url.split("/")[-1]
+                except: sid = f"Server_{i+1}"
+
+                # 5. 在详情页查找续期按钮
+                btn_found = False
+                for txt in RENEW_TEXTS:
+                    btn = self.page.locator(f"button:has-text('{txt}'), a.btn:has-text('{txt}')")
+                    if btn.count() > 0:
+                        if btn.first.is_disabled():
+                            self.log(f"[{sid}] ⏳ 冷却中", "WARNING")
+                            results.append({"id": sid, "status": "⏳ 冷却中"})
+                        else:
+                            self.log(f"[{sid}] ⚡ 点击 '{txt}'...", "INFO")
+                            btn.first.click()
+                            time.sleep(3)
+                            self.log(f"[{sid}] ✅ 成功", "SUCCESS")
+                            results.append({"id": sid, "status": "✅ 成功"})
+                        btn_found = True
+                        break
+                
+                if not btn_found:
+                    self.log(f"[{sid}] ❌ 未找到续期按钮", "ERROR")
+                    self.save_debug(f"no_renew_btn_{i}")
+                    results.append({"id": sid, "status": "❌ 无按钮"})
+                
+                # 稍作休息，防止操作过快
+                time.sleep(2)
+
             return results
 
         except Exception as e:
-            self.log(f"Dashboard 处理出错: {e}", "ERROR")
+            self.log(f"处理流程出错: {e}", "ERROR")
+            self.save_debug("process_error")
             return []
 
     def update_readme(self, results):
@@ -226,42 +211,24 @@ class KataBot:
         except: pass
 
     def run(self):
-        if not LOGIN_EMAIL or not LOGIN_PASSWORD:
-            self.log("未设置邮箱或密码，请检查 Secrets", "ERROR")
-            sys.exit(1)
-
+        if not LOGIN_EMAIL or not LOGIN_PASSWORD: sys.exit(1)
         with sync_playwright() as p:
-            # 启动浏览器 (有头模式 + 反检测)
-            browser = p.chromium.launch(
-                headless=HEADLESS, 
-                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
-            )
-            context = browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
+            browser = p.chromium.launch(headless=HEADLESS, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+            context = browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
             try:
                 from playwright_stealth import stealth_sync
                 stealth_sync(context)
             except: pass
+            if CF_CLEARANCE: context.add_cookies([{'name': 'cf_clearance', 'value': CF_CLEARANCE, 'domain': '.katabump.com', 'path': '/'}])
             
-            # (可选) 注入 CF Clearance 仅用于过盾
-            if CF_CLEARANCE:
-                context.add_cookies([{
-                    'name': 'cf_clearance', 'value': CF_CLEARANCE,
-                    'domain': '.katabump.com', 'path': '/'
-                }])
-
             self.page = context.new_page()
 
-            # 1. 执行登录
             if self.login():
-                # 2. 登录成功，执行续期
                 results = self.process_renewal()
                 self.update_readme(results)
             else:
                 sys.exit(1)
-
+            
             browser.close()
 
 if __name__ == "__main__":
