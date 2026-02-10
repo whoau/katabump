@@ -2,91 +2,59 @@ name: Auto KataBump Renew
 
 on:
   schedule:
-    # 计划任务：UTC 04:00 (北京时间 12:00)，每 3 天运行一次 (1号, 4号, 7号...)
+    # 计划任务：UTC 04:00 (北京时间 12:00)，每 3 天运行一次
     - cron: '0 4 */3 * *'
-  workflow_dispatch: # 允许手动点击按钮触发 (用于测试)
+  workflow_dispatch:
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    
-    # 授予写入权限，以便脚本可以更新 README.md
     permissions:
       contents: write
 
     steps:
-      # 1. 检出代码仓库
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 设置 Python 环境
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # 3. 安装系统级依赖 (关键步骤)
-      # Xvfb: 虚拟显示器，用于模拟有头浏览器环境，绕过 Cloudflare 对 Headless 的检测
-      # fonts-noto-cjk: 中日韩字体，防止网页乱码
-      - name: Install System Dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb fonts-noto-cjk
-
-      # 4. 安装 Python 依赖库
-      - name: Install Python Libraries
-        run: |
-          # 安装 playwright 和 反检测插件
           pip install playwright==1.52.0 playwright-stealth==1.0.6
-          # 安装浏览器内核 (Chromium)
           playwright install chromium --with-deps
 
-      # 5. 运行续期脚本 (核心步骤)
       - name: Run KataBump Script
         env:
-          # 从 GitHub Secrets 读取 Cookie 配置
-          # 必须配置: KATABUMP_COOKIE_NAME (通常是 katabump_s 或 PHPSESSID)
-          KATABUMP_COOKIE_NAME: ${{ secrets.KATABUMP_COOKIE_NAME }}
+          # 必填：网站登录邮箱和密码
+          KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
+          KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
           
-          # 必须配置: KATABUMP_COOKIE_VALUE (对应的值)
-          KATABUMP_COOKIE_VALUE: ${{ secrets.KATABUMP_COOKIE_VALUE }}
-          
-          # 必须配置: KATABUMP_CF_CLEARANCE (Cloudflare 通行证 Cookie)
-          # 这是绕过 5秒盾 死循环的关键！
+          # 可选：CF通行证 (仅用于过盾，不涉及登录)
           KATABUMP_CF_CLEARANCE: ${{ secrets.KATABUMP_CF_CLEARANCE }} 
           
-          # 环境配置：禁用无头模式 + 指定虚拟显示器
           HEADLESS: 'false'
           DISPLAY: ':99'
         run: |
-          # 启动虚拟显示器 (分辨率设为 1920x1080x24)
           Xvfb :99 -screen 0 1920x1080x24 &
-          
-          # 等待 Xvfb 启动
-          sleep 3
-          
-          # 运行 Python 脚本 (确保你的脚本文件名是 katabump.py)
+          sleep 2
           python katabump.py
 
-      # 6. 提交更改 (更新 README.md)
       - name: Commit & Push README
-        if: always() # 即使脚本出错也尝试提交结果报告
+        if: always()
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-          # 检查 README 是否有变动
           if [[ -n $(git status -s README.md) ]]; then
             git add README.md
-            git commit -m "📝 Update KataBump status $(date +'%Y-%m-%d')"
+            git commit -m "📝 Update KataBump status"
             git push
-            echo "README updated."
-          else
-            echo "No changes to README."
           fi
 
-      # 7. 上传截图 (仅当失败时，用于调试)
-      # 如果脚本运行失败，可以在 Actions 页面下载 debug-screenshots.zip 查看
       - name: Upload Debug Artifacts
         if: failure()
         uses: actions/upload-artifact@v4
