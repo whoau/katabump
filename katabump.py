@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-KataBump 自动续期 - 抗超时增强版
-修复：点击 See 后页面加载超时导致脚本崩溃的问题
-策略：放宽页面加载等待条件，超时后尝试强制寻找按钮
+KataBump 自动续期 - 双重点击抗盾版
+修复：
+1. 第一次点击被 CF 拦截导致无效
+2. 增加对 'You can't renew yet' 提示的识别
+策略：点击 -> 等待 -> 再点击 -> 检查文本
 """
 
 import os
@@ -77,7 +79,6 @@ class KataBot:
             self.page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
             if not self.wait_for_cf(timeout=60): return False
             
-            # 等待输入框出现
             try:
                 self.page.wait_for_selector("input[name='email']", timeout=10000)
             except:
@@ -92,10 +93,7 @@ class KataBot:
             if btn.is_visible():
                 self.log("点击登录...", "INFO")
                 btn.click()
-                
-                # 登录后的等待不需要太严格
-                try:
-                    self.page.wait_for_load_state("domcontentloaded", timeout=30000)
+                try: self.page.wait_for_load_state("domcontentloaded", timeout=30000)
                 except: pass
                 
                 self.wait_for_cf()
@@ -114,19 +112,15 @@ class KataBot:
 
     def process_renewal(self):
         results = []
-        
         try:
-            # 1. 确保在 Dashboard
             if "dashboard" not in self.page.url:
                 self.page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
                 self.wait_for_cf()
 
-            # 2. 查找 See 按钮
             selector = "a:has-text('See'), button:has-text('See')"
-            try:
-                self.page.wait_for_selector(selector, timeout=15000)
+            try: self.page.wait_for_selector(selector, timeout=15000)
             except:
-                self.log("⚠️ 未找到 'See' 按钮 (列表为空?)", "WARNING")
+                self.log("⚠️ 未找到 'See' 按钮", "WARNING")
                 return []
 
             count = self.page.locator(selector).count()
@@ -135,7 +129,6 @@ class KataBot:
             for i in range(count):
                 self.log(f"--- 准备处理第 {i+1} 个服务器 ---", "INFO")
                 
-                # 回到 Dashboard
                 if "dashboard" not in self.page.url:
                     self.page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
                     self.wait_for_cf()
@@ -144,58 +137,90 @@ class KataBot:
                 see_btn = self.page.locator(selector).nth(i)
                 if not see_btn.is_visible(): continue
                 
-                self.log("👆 点击 'See' 按钮...", "INFO")
-                
-                # ★ 核心修复：点击后不再死等 networkidle ★
+                self.log("👆 点击 'See'...", "INFO")
                 try:
-                    # 点击
                     see_btn.click()
-                    
-                    # 只要 URL 变了，或者 DOM 加载了就算成功，不用等所有资源加载完
-                    # 设置 60秒超时，如果超时了被 catch 住，依然尝试去找按钮
                     self.page.wait_for_load_state("domcontentloaded", timeout=60000)
                     self.wait_for_cf()
-                    
                 except PlaywrightTimeoutError:
-                    self.log("⚠️ 页面加载超时，但尝试继续寻找按钮...", "WARNING")
-                except Exception as e:
-                    self.log(f"跳转异常: {e}", "ERROR")
+                    self.log("⚠️ 页面加载超时，尝试继续...", "WARNING")
+                except Exception as e: pass
 
-                # 获取 ID
-                try:
-                    sid = self.page.url.split("id=")[1].split("&")[0]
+                try: sid = self.page.url.split("id=")[1].split("&")[0]
                 except: sid = f"Server_{i+1}"
 
                 # 寻找续期按钮
                 btn_found = False
                 for txt in RENEW_TEXTS:
                     btn = self.page.locator(f"button:has-text('{txt}'), a.btn:has-text('{txt}')")
-                    
-                    # 显式等待按钮出现一小会儿
-                    try:
-                        btn.first.wait_for(state="visible", timeout=5000)
+                    try: btn.first.wait_for(state="visible", timeout=5000)
                     except: pass
 
                     if btn.count() > 0:
-                        if btn.first.is_disabled():
-                            self.log(f"[{sid}] ⏳ 冷却中", "WARNING")
+                        btn_el = btn.first
+                        if btn_el.is_disabled():
+                            self.log(f"[{sid}] 按钮禁用", "WARNING")
                             results.append({"id": sid, "status": "⏳ 冷却中"})
                         else:
-                            self.log(f"[{sid}] ⚡ 点击 '{txt}'...", "INFO")
-                            try:
-                                btn.first.click(timeout=10000)
-                                time.sleep(3)
-                                self.log(f"[{sid}] ✅ 成功", "SUCCESS")
+                            # =================================================
+                            # 核心修改：双重点击 + 结果检测
+                            # =================================================
+                            
+                            # 第一次点击 (可能触发 CF)
+                            self.log(f"[{sid}] ⚡ 第 1 次点击 '{txt}'...", "INFO")
+                            try: btn_el.click(timeout=5000)
+                            except: pass
+                            
+                            # 等待 CF 可能出现
+                            self.log(f"[{sid}] 等待 5 秒 (检测 CF)...", "INFO")
+                            time.sleep(5)
+                            self.wait_for_cf() # 如果出了盾，这里会处理
+                            
+                            # 再次检查按钮是否存在 (有些成功后按钮会消失)
+                            if btn_el.is_visible() and btn_el.is_enabled():
+                                self.log(f"[{sid}] ⚡ 第 2 次点击 (确保生效)...", "INFO")
+                                try: btn_el.click(timeout=5000)
+                                except: pass
+                                time.sleep(5)
+
+                            # 检测页面提示
+                            page_content = self.page.content().lower()
+                            
+                            # 1. 检查成功提示
+                            if "successfully" in page_content or "success" in page_content:
+                                self.log(f"[{sid}] ✅ 续期成功！", "SUCCESS")
                                 results.append({"id": sid, "status": "✅ 成功"})
-                            except Exception as e:
-                                self.log(f"[{sid}] 点击失败: {e}", "ERROR")
+                            
+                            # 2. 检查未到期提示
+                            elif "can't renew" in page_content or "you will be able to" in page_content:
+                                # 尝试提取天数
+                                try:
+                                    import re
+                                    days = re.search(r'in (\d+) day', page_content).group(1)
+                                    msg = f"未到期 (剩{days}天)"
+                                except:
+                                    msg = "未到期"
+                                
+                                self.log(f"[{sid}] ⏳ {msg}", "WARNING")
+                                results.append({"id": sid, "status": f"⏳ {msg}"})
+                            
+                            # 3. 兜底
+                            else:
+                                self.log(f"[{sid}] ❓ 未知状态 (盲猜成功)", "INFO")
+                                results.append({"id": sid, "status": "❓ 未知/成功"})
+
                         btn_found = True
                         break
                 
                 if not btn_found:
-                    self.log(f"[{sid}] ❌ 未找到续期按钮", "ERROR")
-                    self.save_debug(f"no_renew_btn_{i}")
-                    results.append({"id": sid, "status": "❌ 无按钮"})
+                    # 检查是否因为已经是 "未到期" 状态导致没有按钮
+                    if "can't renew" in self.page.content().lower():
+                        self.log(f"[{sid}] ⏳ 页面提示未到期", "WARNING")
+                        results.append({"id": sid, "status": "⏳ 未到期"})
+                    else:
+                        self.log(f"[{sid}] ❌ 未找到续期按钮", "ERROR")
+                        self.save_debug(f"no_renew_btn_{i}")
+                        results.append({"id": sid, "status": "❌ 无按钮"})
                 
                 time.sleep(2)
 
@@ -217,19 +242,16 @@ class KataBot:
     def run(self):
         if not LOGIN_EMAIL or not LOGIN_PASSWORD: sys.exit(1)
         with sync_playwright() as p:
-            # 启动配置：设置全局 60秒超时
             browser = p.chromium.launch(headless=HEADLESS, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
             context = browser.new_context(viewport={"width": 1920, "height": 1080})
-            
             try:
                 from playwright_stealth import stealth_sync
                 stealth_sync(context)
             except: pass
-            
             if CF_CLEARANCE: context.add_cookies([{'name': 'cf_clearance', 'value': CF_CLEARANCE, 'domain': '.katabump.com', 'path': '/'}])
             
             self.page = context.new_page()
-            self.page.set_default_timeout(60000) # 全局超时设为 60s
+            self.page.set_default_timeout(60000)
 
             if self.login():
                 results = self.process_renewal()
